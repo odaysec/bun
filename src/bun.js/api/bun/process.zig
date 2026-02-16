@@ -1087,9 +1087,31 @@ pub const WindowsSpawnOptions = struct {
         dup2: struct { out: bun.jsc.Subprocess.StdioKind, to: bun.jsc.Subprocess.StdioKind },
 
         pub fn deinit(this: *const Stdio) void {
-            if (this.* == .buffer) {
-                bun.default_allocator.destroy(this.buffer);
+            switch (this.*) {
+                .buffer => |pipe| closePipeAndDestroy(pipe),
+                .ipc => |pipe| closePipeAndDestroy(pipe),
+                else => {},
             }
+        }
+
+        /// Close a pipe that may have been initialized with uv_pipe_init.
+        /// After uv_pipe_init, the pipe is registered in the event loop's
+        /// handle_queue. Freeing it without uv_close corrupts the queue's
+        /// linked list, causing segfaults on subsequent handle insertions.
+        pub fn closePipeAndDestroy(pipe: *bun.windows.libuv.Pipe) void {
+            if (pipe.loop == null or pipe.isClosed()) {
+                // Never initialized or already fully closed — safe to free directly.
+                bun.default_allocator.destroy(pipe);
+            } else if (!pipe.isClosing()) {
+                // Initialized and not yet closing — must uv_close to remove from handle queue.
+                pipe.close(&onPipeCloseForDeinit);
+            }
+            // else: isClosing — uv_close was already called, the pending close
+            // callback owns the lifetime.
+        }
+
+        fn onPipeCloseForDeinit(pipe: *bun.windows.libuv.Pipe) callconv(.c) void {
+            bun.default_allocator.destroy(pipe);
         }
     };
 
@@ -1630,8 +1652,9 @@ pub fn spawnProcessWindows(
                 stdio.data.fd = fd_i;
             },
             .ipc => |my_pipe| {
-                // ipc option inside stdin, stderr or stdout are not supported
-                bun.default_allocator.destroy(my_pipe);
+                // ipc option inside stdin, stderr or stdout are not supported.
+                // Must close properly since the pipe may have been initialized.
+                WindowsSpawnOptions.Stdio.closePipeAndDestroy(my_pipe);
                 stdio.flags = uv.UV_IGNORE;
             },
             .ignore => {
